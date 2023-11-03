@@ -7,7 +7,7 @@
 TPOT stands for Tree-based Pipeline Optimization Tool. TPOT2 is a Python Automated Machine Learning tool that optimizes machine learning pipelines using genetic programming. Consider TPOT2 your Data Science Assistant.
 
 TPOT2 is a rewrite of TPOT with some additional functionality. Notably, we added support for graph-based pipelines and additional parameters to better specify the desired search space. 
-TPOT2 is currently in Alpha. This means that there will likely be some backwards incompatible changes to the API as we develop. Some implemented features may be buggy. There is a list of known issues written at the bottom of this README. Some features have placeholder names or are listed as "Experimental" in the doc string. These are features that may not be fully implemented and may or may work with all other features.
+TPOT2 is currently in Alpha. This means that there will likely be some backwards incompatible changes to the API as we develop. Some implemented features may be buggy. There is a list of known issues written at the bottom of this README. Some features have placeholder names or are listed as "Experimental" in the doc string. These are features that may not be fully implemented and may or may not work with all other features.
 
 If you are interested in using the current stable release of TPOT, you can do that here: [https://github.com/EpistasisLab/tpot/](https://github.com/EpistasisLab/tpot/). 
 
@@ -17,6 +17,11 @@ If you are interested in using the current stable release of TPOT, you can do th
 Please see the [repository license](https://github.com/EpistasisLab/tpot2/blob/main/LICENSE) for the licensing and usage information for TPOT2.
 Generally, we have licensed TPOT2 to make it as widely usable as possible.
 
+## Documentation
+
+[The documentation webpage can be found here.](https://epistasislab.github.io/tpot2/)
+
+We also recommend looking at the Tutorials folder for jupyter notebooks with examples and guides.
 
 ## Installation
 
@@ -42,6 +47,21 @@ This is to ensure that you get the version that is compatible with your system.
 ```
 conda install --yes -c conda-forge 'lightgbm>=3.3.3'
 ```
+
+### Installing Extra Features with pip
+
+If you want to utilize the additional features provided by TPOT2 along with `scikit-learn` extensions, you can install them using `pip`. The command to install TPOT2 with these extra features is as follows:
+
+```
+pip install tpot2[sklearnex]
+```
+
+Please note that while these extensions can speed up scikit-learn packages, there are some important considerations:
+
+These extensions may not be fully developed and tested on Arm-based CPUs, such as M1 Macs. You might encounter compatibility issues or reduced performance on such systems.
+
+We recommend using Python 3.9 when installing these extra features, as it provides better compatibility and stability.
+
 
 ### Developer/Latest Branch Installation
 
@@ -136,7 +156,7 @@ Setting `verbose` to 5 can be helpful during debugging as it will print out the 
 
 ## Contributing to TPOT2
 
-We welcome you to check the existing issues for bugs or enhancements to work on. If you have an idea for an extension to TPOT, please file a new issue so we can discuss it.
+We welcome you to check the existing issues for bugs or enhancements to work on. If you have an idea for an extension to TPOT2, please file a new issue so we can discuss it.
 
 
 ### Known issues
