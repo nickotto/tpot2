@@ -1,17 +1,11 @@
 #All abstract methods in the Evolutionary_Optimization module
-
-from abc import abstractmethod
 import tpot2
 import typing
 import tqdm
-from tpot2.individual_representations import BaseIndividual
 import time
 import numpy as np
-import copy
-import scipy
 import os
 import pickle
-import statistics
 from tqdm.dask import TqdmCallback
 import distributed
 from dask.distributed import Client
@@ -21,6 +15,15 @@ import math
 from tpot2.utils.utils import get_thresholds, beta_interpolation, remove_items, equalize_list
 import dask
 import warnings
+
+
+def ind_mutate(ind, rng):
+    rng = np.random.default_rng(rng)
+    return ind.mutate(rng=rng)
+
+def ind_crossover(ind1, ind2, rng):
+    rng = np.random.default_rng(rng)
+    return ind1.crossover(ind2, rng=rng)
 
 class SteadyStateEvolver():
     def __init__(   self,
@@ -67,10 +70,10 @@ class SteadyStateEvolver():
                     periodic_checkpoint_folder = None,
                     callback = None,
 
-                    rng_=None
+                    rng=None
                     ) -> None:
 
-        self.rng = np.random.default_rng(rng_)
+        self.rng = np.random.default_rng(rng)
 
         self.max_evaluated_individuals = max_evaluated_individuals
         self.individuals_until_end_budget = individuals_until_end_budget
@@ -176,7 +179,7 @@ class SteadyStateEvolver():
         if self.population is None:
             self.population = tpot2.Population(column_names=init_names)
             initial_population = [next(self.individual_generator) for _ in range(self.initial_population_size)]
-            self.population.add_to_population(initial_population, rng_=self.rng)
+            self.population.add_to_population(initial_population, rng=self.rng)
 
 
     def optimize(self):
@@ -241,6 +244,8 @@ class SteadyStateEvolver():
 
             done = False
             start_time = time.time()
+
+            enough_parents_evaluated=False
             while not done:
 
                 ###############################
@@ -257,20 +262,31 @@ class SteadyStateEvolver():
 
                 #Loop through all futures, collect completed and timeout futures.
                 for completed_future in list(submitted_futures.keys()):
-
+                    eval_error = None
                     #get scores and update
                     if completed_future.done(): #if future is done
                         #If the future is done but threw and error, record the error
                         if completed_future.exception() or completed_future.status == "error": #if the future is done and threw an error
                             print("Exception in future")
                             print(completed_future.exception())
-                            scores = ["INVALID" for _ in range(len(self.objective_names))]
+                            scores = [np.nan for _ in range(len(self.objective_names))]
+                            eval_error = "INVALID"
                         elif completed_future.cancelled(): #if the future is done and was cancelled
                             print("Cancelled future (likely memory related)")
-                            scores = ["INVALID" for _ in range(len(self.objective_names))]
+                            scores = [np.nan for _ in range(len(self.objective_names))]
+                            eval_error = "INVALID"
                         else: #if the future is done and did not throw an error, get the scores
                             try:
                                 scores = completed_future.result()
+
+                                #check if scores contain "INVALID" or "TIMEOUT"
+                                if "INVALID" in scores:
+                                    eval_error = "INVALID"
+                                    scores = [np.nan]
+                                elif "TIMEOUT" in scores:
+                                    eval_error = "TIMEOUT"
+                                    scores = [np.nan]
+
                             except Exception as e:
                                 print("Exception in future, but not caught by dask")
                                 print(e)
@@ -279,19 +295,22 @@ class SteadyStateEvolver():
                                 print("status", completed_future.status)
                                 print("done", completed_future.done())
                                 print("cancelld ", completed_future.cancelled())
-                                scores = ["INVALID" for _ in range(len(self.objective_names))]
+                                scores = [np.nan for _ in range(len(self.objective_names))]
+                                eval_error = "INVALID"
                     else: #if future is not done
 
-                        #check if the future has been running for too long, cancel the future
-                        if time.time() - submitted_futures[completed_future]["time"] > self.max_eval_time_seconds*1.25:
-                            completed_future.cancel()
+                        if self.max_eval_time_seconds is not None:
+                            #check if the future has been running for too long, cancel the future
+                            if time.time() - submitted_futures[completed_future]["time"] > self.max_eval_time_seconds*1.25:
+                                completed_future.cancel()
 
-                            if self.verbose >= 4:
-                                print(f'WARNING AN INDIVIDUAL TIMED OUT (Fallback): \n {submitted_futures[completed_future]} \n')
+                                if self.verbose >= 4:
+                                    print(f'WARNING AN INDIVIDUAL TIMED OUT (Fallback): \n {submitted_futures[completed_future]} \n')
 
-                            scores = ["TIMEOUT" for _ in range(len(self.objective_names))]
-                        else:
-                            continue #otherwise, continue to next future
+                                scores = [np.nan for _ in range(len(self.objective_names))]
+                                eval_error = "TIMEOUT"
+                            else:
+                                continue #otherwise, continue to next future
 
 
 
@@ -304,6 +323,7 @@ class SteadyStateEvolver():
                         scores = [scores[0] for _ in range(len(self.objective_names))]
                     self.population.update_column(this_individual, column_names=self.objective_names, data=scores)
                     self.population.update_column(this_individual, column_names="Completed Timestamp", data=time.time())
+                    self.population.update_column(this_individual, column_names="Eval Error", data=eval_error)
                     if budget is not None:
                         self.population.update_column(this_individual, column_names="Budget", data=this_budget)
 
@@ -314,9 +334,8 @@ class SteadyStateEvolver():
 
                 #now we have a list of completed futures
 
-
-                self.population.remove_invalid_from_population(column_names=self.objective_names, invalid_value="INVALID")
-                self.population.remove_invalid_from_population(column_names=self.objective_names, invalid_value="TIMEOUT")
+                self.population.remove_invalid_from_population(column_names="Eval Error", invalid_value="INVALID")
+                self.population.remove_invalid_from_population(column_names="Eval Error", invalid_value="TIMEOUT")
 
 
                 ###############################
@@ -324,7 +343,7 @@ class SteadyStateEvolver():
                 ###############################
                 if self.verbose >= 3:
                     sign = np.sign(self.objective_function_weights)
-                    valid_df = self.population.evaluated_individuals[~self.population.evaluated_individuals[self.objective_names].isin(["TIMEOUT","INVALID"]).any(axis=1)][self.objective_names]*sign
+                    valid_df = self.population.evaluated_individuals[~self.population.evaluated_individuals[["Eval Error"]].isin(["TIMEOUT","INVALID"]).any(axis=1)][self.objective_names]*sign
                     cur_best_scores = valid_df.max(axis=0)*sign
                     cur_best_scores = cur_best_scores.to_numpy()
                     for i, obj in enumerate(self.objective_names):
@@ -335,7 +354,7 @@ class SteadyStateEvolver():
                         #get sign of objective_function_weights
                         sign = np.sign(self.objective_function_weights)
                         #get best score for each objective
-                        valid_df = self.population.evaluated_individuals[~self.population.evaluated_individuals[self.objective_names].isin(["TIMEOUT","INVALID"]).any(axis=1)][self.objective_names]*sign
+                        valid_df = self.population.evaluated_individuals[~self.population.evaluated_individuals[["Eval Error"]].isin(["TIMEOUT","INVALID"]).any(axis=1)][self.objective_names]*sign
                         cur_best_scores = valid_df.max(axis=0)
                         cur_best_scores = cur_best_scores.to_numpy()
                         #cur_best_scores =  self.population.get_column(self.population.population, column_names=self.objective_names).max(axis=0)*sign #TODO this assumes the current population is the best
@@ -404,13 +423,13 @@ class SteadyStateEvolver():
                         if len(cur_evaluated_population) > self.population_size:
                             scores = evaluated[self.objective_names].to_numpy()
                             weighted_scores = scores * self.objective_function_weights
-                            new_population_index = np.ravel(self.survival_selector(weighted_scores, k=self.population_size, rng_=self.rng)) #TODO make it clear that we are concatenating scores...
+                            new_population_index = np.ravel(self.survival_selector(weighted_scores, k=self.population_size, rng=self.rng)) #TODO make it clear that we are concatenating scores...
 
                             #set new population
                             try:
                                 cur_evaluated_population = np.array(cur_evaluated_population)[new_population_index]
                                 cur_evaluated_population = np.concatenate([cur_evaluated_population, unevaluated["Individual"].to_numpy()])
-                                self.population.set_population(cur_evaluated_population, rng_=self.rng)
+                                self.population.set_population(cur_evaluated_population, rng=self.rng)
                             except Exception as e:
                                 print("Exception in survival selection")
                                 print(e)
@@ -429,36 +448,59 @@ class SteadyStateEvolver():
                 ###############################
                 n_individuals_to_submit = self.max_queue_size - len(submitted_futures)
                 if n_individuals_to_submit > 0:
-                    parents_df = self.population.get_column(self.population.population, column_names=self.objective_names+ ["Individual"], to_numpy=False)
-                    parents_df = parents_df[~parents_df[self.objective_names].isin(["TIMEOUT","INVALID"]).any(axis=1)]
-                    parents_df = parents_df[~parents_df[self.objective_names].isna().any(axis=1)]
+                    #count non-nan values in the objective columns
+                    if not enough_parents_evaluated:
+                        parents_df = self.population.get_column(self.population.population, column_names=self.objective_names, to_numpy=False)
+                        scores = parents_df[self.objective_names[0]].to_numpy()
+                        #count non-nan values in the objective columns
+                        n_evaluated = np.count_nonzero(~np.isnan(scores))
+                        if n_evaluated >0 :
+                            enough_parents_evaluated=True
+                    
+                    # parents_df = self.population.get_column(self.population.population, column_names=self.objective_names+ ["Individual"], to_numpy=False)
+                    # parents_df = parents_df[~parents_df[self.objective_names].isin(["TIMEOUT","INVALID"]).any(axis=1)]
+                    # parents_df = parents_df[~parents_df[self.objective_names].isna().any(axis=1)]
 
-                    cur_evaluated_population = parents_df["Individual"].to_numpy()
-                    if len(cur_evaluated_population) > 0:
-                        scores = parents_df[self.objective_names].to_numpy()
-                        weighted_scores = scores * self.objective_function_weights
-                        #number of crossover pairs and mutation only parent to generate
+                    # cur_evaluated_population = parents_df["Individual"].to_numpy()
+                    # if len(cur_evaluated_population) > 0:
+                    #     scores = parents_df[self.objective_names].to_numpy()
+                    #     weighted_scores = scores * self.objective_function_weights
+                    #     #number of crossover pairs and mutation only parent to generate
 
-                        if len(parents_df) < 2:
-                            var_ops = ["mutate" for _ in range(n_individuals_to_submit)]
-                        else:
-                            var_ops = [self.rng.choice(["crossover","mutate_then_crossover","crossover_then_mutate",'mutate'],p=[self.crossover_probability,self.mutate_then_crossover_probability, self.crossover_then_mutate_probability,self.mutate_probability]) for _ in range(n_individuals_to_submit)]
+                    #     if len(parents_df) < 2:
+                    #         var_ops = ["mutate" for _ in range(n_individuals_to_submit)]
+                    #     else:
+                    #         var_ops = [self.rng.choice(["crossover","mutate_then_crossover","crossover_then_mutate",'mutate'],p=[self.crossover_probability,self.mutate_then_crossover_probability, self.crossover_then_mutate_probability,self.mutate_probability]) for _ in range(n_individuals_to_submit)]
 
-                        parents = []
-                        for op in var_ops:
+                    #     parents = []
+                    #     for op in var_ops:
+                    #         if op == "mutate":
+                    #             parents.extend(np.array(cur_evaluated_population)[self.parent_selector(weighted_scores, k=1, n_parents=1, rng=self.rng)])
+                    #         else:
+                    #             parents.extend(np.array(cur_evaluated_population)[self.parent_selector(weighted_scores, k=1, n_parents=2, rng=self.rng)])
+
+                    #     #_offspring = self.population.create_offspring2(parents, var_ops, rng=self.rng, add_to_population=True)
+                    #     offspring = self.population.create_offspring2(parents, var_ops, [ind_mutate], None, [ind_crossover], None, add_to_population=True, keep_repeats=False, mutate_until_unique=True, rng=self.rng)
+
+                    if enough_parents_evaluated:
+
+                        parents = self.population.parent_select(selector=self.parent_selector, weights=self.objective_function_weights, columns_names=self.objective_names, k=n_individuals_to_submit, n_parents=2, rng=self.rng)
+                        p = np.array([self.crossover_probability, self.mutate_then_crossover_probability, self.crossover_then_mutate_probability, self.mutate_probability])
+                        p = p / p.sum()
+                        var_op_list = self.rng.choice(["crossover", "mutate_then_crossover", "crossover_then_mutate", "mutate"], size=n_individuals_to_submit, p=p)
+
+                        for i, op in enumerate(var_op_list):
                             if op == "mutate":
-                                parents.extend(np.array(cur_evaluated_population)[self.parent_selector(weighted_scores, k=1, n_parents=1, rng_=self.rng)])
-                            else:
-                                parents.extend(np.array(cur_evaluated_population)[self.parent_selector(weighted_scores, k=1, n_parents=2, rng_=self.rng)])
+                                parents[i] = parents[i][0] #mutations take a single individual
 
-                        _offspring = self.population.create_offspring(parents, var_ops, rng_=self.rng, n_jobs=1, add_to_population=True)
+                        offspring = self.population.create_offspring2(parents, var_op_list, [ind_mutate], None, [ind_crossover], None, add_to_population=True, keep_repeats=False, mutate_until_unique=True, rng=self.rng)
 
                     # If we don't have enough evaluated individuals to use as parents for variation, we create new individuals randomly
                     # This can happen if the individuals in the initial population are invalid
-                    if len(cur_evaluated_population) == 0 and len(submitted_futures) < self.max_queue_size:
+                    elif len(submitted_futures) < self.max_queue_size:
 
                         initial_population = self.population.evaluated_individuals.iloc[:self.initial_population_size*3]
-                        invalid_initial_population = initial_population[initial_population[self.objective_names].isin(["TIMEOUT","INVALID"]).any(axis=1)]
+                        invalid_initial_population = initial_population[initial_population[["Eval Error"]].isin(["TIMEOUT","INVALID"]).any(axis=1)]
                         if len(invalid_initial_population) >= self.initial_population_size*3: #if all individuals in the 3*initial population are invalid
                             raise Exception("No individuals could be evaluated in the initial population. This may indicate a bug in the configuration, included models, or objective functions. Set verbose>=4 to see the errors that caused individuals to fail.")
 
@@ -499,8 +541,8 @@ class SteadyStateEvolver():
         # Step 7: Cleanup
         ###############################
 
-        self.population.remove_invalid_from_population(column_names=self.objective_names, invalid_value="INVALID")
-        self.population.remove_invalid_from_population(column_names=self.objective_names, invalid_value="TIMEOUT")
+        self.population.remove_invalid_from_population(column_names="Eval Error", invalid_value="INVALID")
+        self.population.remove_invalid_from_population(column_names="Eval Error", invalid_value="TIMEOUT")
 
 
         #done, cleanup futures
@@ -515,7 +557,7 @@ class SteadyStateEvolver():
             self._client.close()
             self._cluster.close()
 
-        tpot2.utils.get_pareto_frontier(self.population.evaluated_individuals, column_names=self.objective_names, weights=self.objective_function_weights, invalid_values=["TIMEOUT","INVALID"])
+        tpot2.utils.get_pareto_frontier(self.population.evaluated_individuals, column_names=self.objective_names, weights=self.objective_function_weights)
 
 
 

@@ -145,6 +145,7 @@ def parallel_eval_objective_list2(individual_list,
                                 max_eval_time_seconds=None,
                                 n_expected_columns=None,
                                 client=None,
+                                scheduled_timeout_time=None,
                                 **objective_kwargs):
 
     individual_stack = list(individual_list)
@@ -152,7 +153,7 @@ def parallel_eval_objective_list2(individual_list,
     submitted_futures = {}
     scores_dict = {}
     submitted_inds = set()
-
+    global_timeout_triggered = False
     while len(submitted_futures) < max_queue_size and len(individual_stack)>0:
         individual = individual_stack.pop()
         future = client.submit(eval_objective_list, individual,  objective_list, verbose=verbose, timeout=max_eval_time_seconds,**objective_kwargs)
@@ -173,6 +174,8 @@ def parallel_eval_objective_list2(individual_list,
         except dask.distributed.CancelledError:
             pass
 
+        global_timeout_triggered = scheduled_timeout_time is not None and time.time() > scheduled_timeout_time
+
         #Loop through all futures, collect completed and timeout futures.
         for completed_future in list(submitted_futures.keys()):
             #get scores and update                            
@@ -181,13 +184,25 @@ def parallel_eval_objective_list2(individual_list,
                 if completed_future.exception() or completed_future.status == "error": #if the future is done and threw an error
                     print("Exception in future")
                     print(completed_future.exception())
-                    scores = ["INVALID"]
+                    scores = [np.nan for _ in range(n_expected_columns)]
+                    eval_error = "INVALID"
                 elif completed_future.cancelled(): #if the future is done and was cancelled
                     print("Cancelled future (likely memory related)")
-                    scores = ["INVALID"]
+                    scores = [np.nan for _ in range(n_expected_columns)]
+                    eval_error = "INVALID"
                 else: #if the future is done and did not throw an error, get the scores
                     try:
                         scores = completed_future.result()
+                        #check if scores contain "INVALID" or "TIMEOUT"
+                        if "INVALID" in scores:
+                            eval_error = "INVALID"
+                            scores = [np.nan for _ in range(n_expected_columns)]
+                        elif "TIMEOUT" in scores:
+                            eval_error = "TIMEOUT"
+                            scores = [np.nan for _ in range(n_expected_columns)]
+                        else:
+                            eval_error = None
+                        
                     except Exception as e:
                         print("Exception in future, but not caught by dask")
                         print(e)
@@ -196,17 +211,30 @@ def parallel_eval_objective_list2(individual_list,
                         print("status", completed_future.status)
                         print("done", completed_future.done())
                         print("cancelld ", completed_future.cancelled())
-                        scores = ["INVALID"]
+                        scores = [np.nan for _ in range(n_expected_columns)]
+                        eval_error = "INVALID"
             else: #if future is not done
                 
+                
+
                 #check if the future has been running for too long, cancel the future
-                if time.time() - submitted_futures[completed_future]["time"] > max_eval_time_seconds*1.25:
+                if max_eval_time_seconds is not None and time.time() - submitted_futures[completed_future]["time"] > max_eval_time_seconds*1.25:
                     completed_future.cancel()
                     
                     if verbose >= 4:
                         print(f'WARNING AN INDIVIDUAL TIMED OUT (Fallback): \n {submitted_futures[completed_future]} \n')
                     
-                    scores = ["TIMEOUT"]
+                    scores = [np.nan for _ in range(n_expected_columns)]
+                    eval_error = "TIMEOUT"
+                elif global_timeout_triggered:
+                    completed_future.cancel()
+                    
+                    if verbose >= 4:
+                        print(f'WARNING AN INDIVIDUAL TIMED OUT (max_time_seconds): \n {submitted_futures[completed_future]} \n')
+                    
+                    scores = [np.nan for _ in range(n_expected_columns)]
+                    eval_error = None
+
                 else:
                     continue #otherwise, continue to next future
         
@@ -215,12 +243,24 @@ def parallel_eval_objective_list2(individual_list,
             scores_dict[cur_individual] = {"scores": scores, 
                                         "start_time": submitted_futures[completed_future]["time"],
                                         "end_time": time.time(),
+                                        "eval_error": eval_error,
                                         }
             
 
             #update submitted futures
             submitted_futures.pop(completed_future)
         
+        #break if timeout
+        if global_timeout_triggered:
+            while len(individual_stack) > 0:
+                individual = individual_stack.pop()
+                scores_dict[individual] = {"scores": [np.nan for _ in range(n_expected_columns)], 
+                                        "start_time": time.time(),
+                                        "end_time": time.time(),
+                                        "eval_error": None,
+                                        }
+            break
+
         #submit new futures
         while len(submitted_futures) < max_queue_size and len(individual_stack)>0:
             individual = individual_stack.pop()
@@ -232,13 +272,15 @@ def parallel_eval_objective_list2(individual_list,
             submitted_inds.add(individual.unique_id())
 
 
+    #collect remaining futures
+
+
     final_scores = [scores_dict[individual]["scores"] for individual in individual_list]
     final_start_times = [scores_dict[individual]["start_time"] for individual in individual_list]
     final_end_times = [scores_dict[individual]["end_time"] for individual in individual_list]
-
+    final_eval_errors = [scores_dict[individual]["eval_error"] for individual in individual_list]
     final_scores = process_scores(final_scores, n_expected_columns)
-
-    return final_scores, final_start_times, final_end_times
+    return final_scores, final_start_times, final_end_times, final_eval_errors
 
 
 ###################
